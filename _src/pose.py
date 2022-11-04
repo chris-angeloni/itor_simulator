@@ -1,5 +1,111 @@
 from cellworld import *
 import numpy as np
+import glob
+from tqdm.notebook import tqdm
+import pandas as pd
+
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+def build_pose_library(logs,filename='./_data/logs/pose_library.pkl'):
+    '''
+    Builds a pose library from a list of .json logs
+    Inputs:
+    - logs: list of .json logs
+    - filename: .pkl file name for dataframe
+    Returns:
+    - df: dataframe where each row represents a frame where the mouse was visible
+        'mouse': mouse ID
+        'session': date and time of experiment
+        'experiment_type': experiment type
+        'world': world ID
+        'episode': episode number
+        'frame': frame number
+        'pose': pose object (JsonList)
+        'head_angle': head angle of the mouse
+        'start_dist': distance from start of habitat (Location(0.01,0.5))
+        'score_mean': mean of pose scores
+        'score_std': std of pose scores
+        'predator_location': Location of predator
+        'predator_angle': orientation of predator
+        'log_file': location of the log file for this frame}
+    '''
+
+    if glob.glob(filename):
+        warnings.warn(f'{filename} found, loading...')
+        df = pd.read_pickle(filename)
+        return df
+
+    start_location = Location(0.01,0.5)
+
+    d = {}
+    cnt = 0
+    for i in tqdm(range(len(logs))):
+        # load experiment
+        e = Experiment.load_from_file(logs[i])
+
+        # get filename
+        fn = e.name.split('_')
+        mouse = fn[3]
+        session = '_'.join(fn[1:3])
+        world = '_'.join(fn[4:6])
+        experiment_type = fn[-1]
+
+        # print(e.name)
+        # print('\t',end='')
+
+        for j,ep in enumerate(e.episodes):
+            # get episode and trajectories
+            episode = j
+            pt = ep.trajectories.where('agent_name','prey').get_unique_steps()
+            rt = ep.trajectories.where('agent_name','predator')
+            # print(j,end=' ')
+
+            # for each frame
+            for step in pt:
+                if step.data:
+                    # prey info
+                    frame = step.frame
+                    pose = PoseList.parse(step.data)
+                    head_angle = step.rotation
+                    start_dist = pose[1].location.dist(start_location)
+                    score_mean = np.array([p.score for p in pose]).mean()
+                    score_std = np.array([p.score for p in pose]).std()
+
+                    # predator info
+                    rind = np.where(np.array(rt.get('frame'))==step.frame)[0]
+                    if len(rind) > 0:
+                        predator_location = rt[rind[0]].location
+                        predator_angle = rt[rind[0]].rotation
+                    else:
+                        predator_location = np.nan
+                        predator_angle = np.nan
+
+                    # append to dict
+                    d[cnt] = {
+                        'mouse': mouse,
+                        'session': session,
+                        'experiment_type': experiment_type,
+                        'world': world,
+                        'episode': episode,
+                        'frame': frame,
+                        'pose': pose,
+                        'head_angle': head_angle,
+                        'start_dist': start_dist,
+                        'score_mean': score_mean,
+                        'score_std': score_std,
+                        'predator_location': predator_location,
+                        'predator_angle': predator_angle,
+                        'log_file': logs[i]}
+                    cnt = cnt + 1
+        # print('\n')
+
+    # save to file
+    print(f'saving pose library to {filename}')
+    df = pd.DataFrame.from_dict(d,'index')
+    df.to_pickle(filename)
+
+    return df
 
 # pose functions
 def get_pose_dict(step):
@@ -90,6 +196,9 @@ def rotate(p, origin=(0, 0), degrees=0):
     o = np.atleast_2d(origin)
     p = np.atleast_2d(p)
     return np.squeeze((R @ (p.T-o.T) + o.T).T)
+
+
+
 
 # json classes
 class PoseList(JsonList):
