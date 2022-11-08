@@ -5,6 +5,12 @@ from tqdm.notebook import tqdm
 import rtree
 import matplotlib.path as mpath
 import matplotlib.patches as mpatches
+import os
+from random import choices
+import pandas as pd
+
+from .pose import *
+from .multiproc import *
 
 
 def get_closest_tile(loc,vis_graph):
@@ -121,6 +127,7 @@ def get_tiles(n,e):
     return points[~index,:]
 
 
+
 def compute_itor(pose,head_angle,vis_graph,head_parts=['head_base'],body_parts=['body_mid'],fov = np.rad2deg(1.74533)):
     """Returns ITOR value and various visible points in the environment based on
     pose, head angle, FOV"""
@@ -187,7 +194,7 @@ def compute_itor_pose(pose,head_angle,vis_graph,head_parts=['head_base'],body_pa
             # get points in the FOV
             fov_verts = get_fov_points(ppoints[head_ind,:],head_angle,vis_graph,fov)
 
-            # which vertices that are visible to the head:
+            # get vertices that are visible to the head:
             vis_verts = np.any(v[head_ind,:],axis=0) & fov_verts
 
             # of FOV visible vertices, which ones are visible to the body:
@@ -205,3 +212,161 @@ def compute_itor_pose(pose,head_angle,vis_graph,head_parts=['head_base'],body_pa
 
     return {'ITOR':ITOR,
             'pose_points': ppoints}
+
+
+def compute_itor_null(
+    log,
+    poselib,
+    vis_graph,
+    d,
+    outpath = './_data/results',
+    k = 500,
+    score_cutoff = 0.8,
+    dist_cutoff = 0.00,
+    body_parts = ['body_mid','tail_base','tail_post_base','tail_pre_tip','tail_tip'],
+    start_ep = 0):
+
+    '''
+    Computes a null distribution of ITOR values
+    Inputs:
+    - log: an experiment log file containing pose information
+    - poselib: a poselibrary containing many different poses
+    - vis_graph: a visibility graph for the experiment world
+    - d: a display object for the world
+    - outpath: where to save the .pkl results
+    - k: number of null samples (500 default)
+    - score_cutoff: camera score to exclude frames with poor tracking (0.8 default)
+    - dist_cutoff: distance from start to exclude frames (0.00 default)
+    - body_parts: the body parts to include in the ITOR computation (all by default)
+    - start_ep: the episode to start looping over (default is 0, use for debugging only)
+    '''
+
+    # setup
+    l = log
+    if not os.path.exists(outpath):
+        os.mkdir(outpath)
+    print(l)
+    # get the poses for this experiment
+    p = poselib.loc[poselib.log_file == l]
+    if len(p) > 0:
+
+        # get the pose library for this mouse
+        pl = poselib.loc[poselib.mouse == p.iloc[0].mouse]
+
+        # for each episode
+        uep = p.episode.unique()
+        for ep in range(start_ep, uep.shape[0]):
+        #for ep in tqdm(range(uep.shape[0])):
+            print(f' Episode {ep}')
+
+            # check if the file exists
+            fn = l.split('\\')[-1].replace('experiment.json',f'episode{ep:03d}.pkl',1)
+            filepath = os.path.join(outpath,fn)
+            if not os.path.exists(filepath):
+
+                # get frames from this episode
+                episode = p.loc[(p.episode == uep[ep])]
+
+                # define poses to sample from for this mouse
+                I = ((pl.episode != uep[ep]) | \
+                     (pl.session != episode.session.unique()[0])) & \
+                     (pl.score_mean > score_cutoff) & \
+                     (pl.pose_ordered)
+
+                # loop through frames
+                D = {} # dictionary to store results
+                dcnt = 0
+                for index,row in tqdm(episode.iterrows(), total=episode.shape[0]):
+                #for index,row in episode.iterrows():
+
+                    # if the true pose is in the arena and has good tracking
+                    if pose_inside_arena(row.pose,d) & \
+                    (row.start_dist > dist_cutoff) & \
+                    (row.score_mean > score_cutoff) & \
+                    (row.pose_ordered):
+
+                        #print(f'  Frame {row.frame}/{episode.frame.max()}',end=' ')
+                        #pbar = tqdm(total=k)
+
+                        # compute true ITOR
+                        itor = compute_itor_pose(row.pose,
+                          row.head_angle,
+                          vis_graph,
+                          head_parts=['head_base'],
+                          body_parts=body_parts)
+
+                        # generate a null ITOR distribution
+                        cnt = 0
+                        null_pose_index = []
+                        null_pose_itor = []
+                        null_pose = []
+                        while (cnt < k):
+
+                            # get a pose sample
+                            samp = choices(np.argwhere(np.array(I)),k=1)[0]
+                            pose_samp = pl.iloc[samp].pose.item()
+
+                            # transform it
+                            pose_null,src_angle,src_loc,ref_angle,ref_loc = \
+                            match_pose(row.pose,pose_samp)
+
+                            # check if pose sample is in the arena, not in obstacles, and ordered
+                            # good_sample = True
+                            good_sample = pose_inside_arena(pose_null,d) and \
+                                          not pose_inside_occlusions(pose_null,d)
+
+                            # if a good sample, compute ITOR
+                            if good_sample:
+                                itor_null = compute_itor_pose(pose_null,
+                                  row.head_angle,
+                                  vis_graph,
+                                  head_parts=['head_base'],
+                                  body_parts=body_parts)
+                                null_pose_index.append(pl.iloc[samp].index)
+                                null_pose_itor.append(itor_null['ITOR'])
+                                null_pose.append(itor_null['pose_points'])
+                                #pbar.update(1)
+                                cnt = cnt + 1
+
+                        # add to dictionary
+                        row['ITOR'] = itor['ITOR']
+                        row['null_ITOR'] = null_pose_itor
+                        row['null_index'] = null_pose_index
+                        row['null_pose'] = null_pose
+                        D[dcnt] = row.to_dict()
+                        dcnt = dcnt + 1
+                        #pbar.close
+
+                # convert the episode dictionary to a dataframe and save
+                print('  saving...')
+                df = pd.DataFrame.from_dict(D,'index')
+                df.to_pickle(filepath)
+
+            else:
+                print(f'{filepath} exists... skipping...')
+
+
+def compute_itor_null_fast(args):
+    log,shared_poselib,shared_A,shared_V,shared_src,shared_dst = args
+
+    # read everything from shared memory
+    poselib = shared_poselib.read()
+    A = shared_A.read()
+    V = shared_V.read()
+    src = shared_src.read()
+    dst = shared_dst.read()
+
+    # build dictionary as expected by compute_itor_null
+    vis_graph = {'V':V,'A':A,'src':pts,'dst':sparse_arr}
+
+    # get the display
+    e = Experiment.load_from_file(log)
+    vis,w = get_vis(e)
+    d = Display(w)
+
+    print(log)
+
+    # call the old function
+    compute_itor_null(log,poselib,vis_graph,d,k=1,outpath='./_data/mptest')
+
+    return True
